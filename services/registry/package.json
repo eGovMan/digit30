@@ -1,0 +1,20 @@
+{
+    "name": "registry-service",
+    "version": "1.0.0",
+    "description": "Registry Service",
+    "main": "index.js",
+    "scripts": {
+      "start": "node index.js"
+    },
+    "dependencies": {
+        "express": "^4.17.1",
+        "pg": "^8.7.3",
+        "node-fetch": "^2.6.7",
+        "uuid": "^8.3.2",
+        "jsonwebtoken": "^9.0.2",
+        "jwks-rsa": "^3.1.0",
+        "cors": "^2.8.5"
+    },
+    "author": "eGovernments Foundation",
+    "license": "MIT"
+  }

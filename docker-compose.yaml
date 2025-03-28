@@ -1,0 +1,128 @@
+services:
+  console-frontend:
+    build:
+      context: ./console/frontend
+      dockerfile: Dockerfile
+    environment:
+      - PORT=3001
+      - HOST=0.0.0.0
+    ports:
+      - "3001:3001"  # Map host:container port
+
+  console-backend:
+    build:
+      context: ./console/backend
+      dockerfile: Dockerfile
+    environment:
+      - PORT=11000
+    ports:
+      - "11000:11000"
+    # For localhost:4000 to work, identity-service must be reachable
+    # Alternatively, use depends_on if internal communication needed
+
+  postgres:
+    image: postgres:14
+    environment:
+      - POSTGRES_DB=registry
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "admin", "-d", "registry"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  account-service:
+    build:
+      context: ./services/account
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - PORT=12000
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=registry
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - KEYCLOAK_ADMIN_URL=http://host.docker.internal:8080
+      - KEYCLOAK_ADMIN_USERNAME=admin
+      - KEYCLOAK_ADMIN_PASSWORD=admin  # Replace with your Keycloak admin password
+    ports:
+      - "12000:12000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+  database-service:
+    build:
+      context: ./services/registry/database
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - PORT=5001
+      - POSTGRES_HOST=postgres  # Service name instead of localhost
+      - POSTGRES_DB=registry
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs
+      - KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30
+      - KEYCLOAK_AUDIENCE=account
+    ports:
+      - "5001:5001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  registry-service:
+    build:
+      context: ./services/registry
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - PORT=6000
+      - POSTGRES_HOST=postgres
+      - POSTGRES_DB=registry
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs
+      - KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30
+      - KEYCLOAK_AUDIENCE=account
+    ports:
+      - "6000:6000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      database-service:
+        condition: service_started
+
+  enrollment-service:
+    build:
+      context: ./services/identity/enrollment
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs
+      - KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30
+      - KEYCLOAK_AUDIENCE=account
+    ports:
+      - "3000:3000"
+
+  identity-service:
+    build:
+      context: ./services/identity
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      - KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs
+      - KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30
+      - KEYCLOAK_AUDIENCE=account
+    ports:
+      - "4000:4000"
+
+volumes:
+  postgres-data:
+    driver: local

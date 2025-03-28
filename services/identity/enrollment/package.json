@@ -1,0 +1,22 @@
+{
+    "name": "enrollment-service",
+    "version": "1.0.0",
+    "description": "Enrollment Service.",
+    "main": "index.js",
+    "scripts": {
+      "start": "node index.js",
+      "dev": "nodemon index.js"
+    },
+    "author": "eGovernments Foundation",
+    "license": "MIT",
+    "dependencies": {
+      "express": "^4.17.1",
+      "node-fetch": "^2.6.7",
+      "jsonwebtoken": "^9.0.2",
+      "jwks-rsa": "^3.1.0",
+      "cors": "^2.8.5"
+    },
+    "devDependencies": {
+      "nodemon": "^3.0.2"
+    }
+  }
