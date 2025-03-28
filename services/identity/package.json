@@ -1,0 +1,19 @@
+{
+    "name": "identity-service",
+    "version": "1.0.0",
+    "description": "OIDC-based Identity Service integrated with Keycloak",
+    "main": "index.js",
+    "scripts": {
+      "start": "node index.js"
+    },
+    "dependencies": {
+      "express": "^4.17.1",
+      "jsonwebtoken": "^9.0.2",
+      "jwks-rsa": "^3.1.0",
+      "node-fetch": "^2.6.7",
+      "cors": "^2.8.5",
+      "cookie-parser": "^1.4.6"
+    },
+    "author": "eGovernment Foundation",
+    "license": "MIT"
+  }
