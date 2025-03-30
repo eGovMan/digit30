@@ -4,6 +4,7 @@ const jwksClient = require('jwks-rsa');
 const fetch = require('node-fetch');
 const cors = require('cors');
 
+
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -12,8 +13,10 @@ app.use(cors({
   credentials: true
 }));
 
-const PORT = process.env.PORT || 4000;
-const KEYCLOAK_HOST_URL = process.env.KEYCLOAK_HOST_URL || 'http://host.docker.internal:8080'; // Ensure this is correct
+const KEYCLOAK_HOST_URL = process.env.KEYCLOAK_HOST_URL || 'http://host.docker.internal:8080';
+const CONSUL_HOST = process.env.CONSUL_HOST || 'consul';
+const CONSUL_PORT = process.env.CONSUL_PORT || 8500;
+
 
 const getJwksClient = (realm) => jwksClient({
   jwksUri: `${KEYCLOAK_HOST_URL}/realms/${realm}/protocol/openid-connect/certs`,
@@ -50,6 +53,87 @@ function verifyToken(req, res, next) {
   });
 }
 
+// Register service with Consul
+async function registerServiceWithConsul({ ID, Name, Address, Port }) {
+    const maxRetries = 5;
+    let attempt = 0;
+  
+    while (attempt < maxRetries) {
+      try {
+        const response = await fetch(`http://${CONSUL_HOST}:${CONSUL_PORT}/v1/agent/service/register`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ID,
+            Name,
+            Address,
+            Port
+          })
+        });
+        if (!response.ok) {
+          throw new Error(`Consul registration failed: ${response.status} ${await response.text()}`);
+        }
+        console.log(`Registered with Consul as ${ID} on port ${Port}`);
+        return;
+      } catch (err) {
+        console.error(`Attempt ${attempt + 1} failed to register with Consul: ${err.message}`);
+        attempt++;
+        if (attempt === maxRetries) {
+          console.error(`Failed to register with Consul after ${maxRetries} attempts: ${err.message}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+  }
+  
+  async function deregisterServiceFromConsul(serviceId) {
+    try {
+      const response = await fetch(`http://${CONSUL_HOST}:${CONSUL_PORT}/v1/agent/service/deregister/${serviceId}`, {
+        method: 'PUT'
+      });
+      if (!response.ok) {
+        throw new Error(`Consul deregistration failed: ${response.status} ${await response.text()}`);
+      }
+      console.log(`Deregistered ${serviceId} from Consul`);
+    } catch (err) {
+      console.error(`Failed to deregister ${serviceId} from Consul: ${err.message}`);
+    }
+  }
+
+async function registerService(port) {
+  const serviceId = `identity-${Date.now()}`; 
+  const maxRetries = 5;
+  let attempt = 0;
+
+  while (attempt < maxRetries) {
+    try {
+      await registerServiceWithConsul({
+        ID: serviceId,
+        Name: 'identity-service', 
+        Address: process.env.HOSTNAME || 'identity-service',
+        Port: port
+      });
+      console.log(`Registered with Consul as ${serviceId} on port ${port}`);
+
+      process.on('SIGINT', async () => {
+        await deregisterServiceFromConsul(serviceId);
+        console.log(`Deregistered ${serviceId} from Consul`);
+        process.exit();
+      });
+      return;
+    } catch (err) {
+      console.error(`Attempt ${attempt + 1} failed to register with Consul: ${err.message}`);
+      attempt++;
+      if (attempt === maxRetries) {
+        throw new Error(`Failed to register with Consul after ${maxRetries} attempts: ${err.message}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+}
+// Health check endpoint
+app.get('/health', (req, res) => res.status(200).json({ status: 'healthy' }));
+
 app.get('/authorize', (req, res) => {
   const { scope, response_type, client_id, redirect_uri, state, nonce, realm, username } = req.query;
 
@@ -63,7 +147,7 @@ app.get('/authorize', (req, res) => {
     return res.status(400).send('Unsupported response_type');
   }
 
-  const keycloakAuthUrl = `http://localhost:8080/realms/${realm}/protocol/openid-connect/auth?` +
+  const keycloakAuthUrl = `${KEYCLOAK_HOST_URL}/realms/${realm}/protocol/openid-connect/auth?` +
     `response_type=${encodeURIComponent(response_type)}&` +
     `client_id=${encodeURIComponent(client_id)}&` +
     `redirect_uri=${encodeURIComponent(redirect_uri)}&` +
@@ -123,6 +207,17 @@ app.post('/oauth/token', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Identity Service running on port ${PORT}`);
-});
+async function startServer() {
+  try {
+    const server = app.listen(0, async () => {
+      const port = server.address().port; // Corrected to use server object
+      await registerService(port);
+      console.log(`Identity Service running on dynamically assigned port ${port}`);
+    });
+  } catch (err) {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  }
+}
+
+startServer();

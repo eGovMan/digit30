@@ -1,25 +1,4 @@
 services:
-  console-frontend:
-    build:
-      context: ./console/frontend
-      dockerfile: Dockerfile
-    environment:
-      - PORT=3001
-      - HOST=0.0.0.0
-    ports:
-      - "3001:3001"  # Map host:container port
-
-  console-backend:
-    build:
-      context: ./console/backend
-      dockerfile: Dockerfile
-    environment:
-      - PORT=11000
-    ports:
-      - "11000:11000"
-    # For localhost:4000 to work, identity-service must be reachable
-    # Alternatively, use depends_on if internal communication needed
-
   postgres:
     image: postgres:14
     environment:
@@ -29,12 +8,108 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "5432:5432"  # Standard port: 5432
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "admin", "-d", "registry"]
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - app-network
+
+  consul:
+    image: hashicorp/consul:1.15
+    ports:
+      - "8500:8500"  # Standard port: 8500
+    command: "agent -server -bootstrap -ui -client=0.0.0.0"
+    networks:
+      - app-network
+
+  kong-db:
+    image: postgres:13
+    environment:
+      - POSTGRES_DB=kong
+      - POSTGRES_USER=kong
+      - POSTGRES_PASSWORD=kongpass
+    volumes:
+      - kong-db-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "kong", "-d", "kong"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  kong:
+    build:
+      context: ./services/kong-synch
+      dockerfile: Dockerfile.kong
+    environment:
+      - KONG_DATABASE=postgres
+      - KONG_PG_HOST=kong-db
+      - KONG_PG_USER=kong
+      - KONG_PG_PASSWORD=kongpass
+      - KONG_PG_PORT=5432
+      - KONG_PROXY_ACCESS_LOG=/dev/stdout
+      - KONG_ADMIN_ACCESS_LOG=/dev/stdout
+      - KONG_PROXY_ERROR_LOG=/dev/stderr
+      - KONG_ADMIN_ERROR_LOG=/dev/stderr
+      - KONG_ADMIN_LISTEN=0.0.0.0:8001
+      - KONG_PROXY_LISTEN=0.0.0.0:8000
+      - KONG_SERVICE_DISCOVERY=consul
+      - KONG_CONSUL_HOST=consul
+      - KONG_CONSUL_PORT=8500
+      - KONG_NGINX_DAEMON=off 
+    ports:
+      - "8000:8000"
+      - "8001:8001"
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:8001/status"]
+    #   interval: 5s
+    #   timeout: 5s
+    #   retries: 10
+    depends_on:
+      kong-db:
+        condition: service_healthy
+      consul:
+        condition: service_started
+    networks:
+      - app-network
+
+  kong-synch:  # Match logs naming
+    build:
+      context: ./services/kong-synch
+      dockerfile: Dockerfile
+    command: "node synch.js"
+    depends_on:
+      kong:
+        condition: service_healthy
+      consul:
+        condition: service_started
+    networks:
+      - app-network
+
+  registration-service:
+    build:
+      context: ./services/registration
+      dockerfile: Dockerfile
+    environment:
+      - NODE_ENV=production
+      - PORT=0
+      - POSTGRES_HOST=postgres
+      - CONSUL_HOST=consul
+      - HOSTNAME=registration-service
+      - KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs
+      - KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30
+      - KEYCLOAK_AUDIENCE=account
+    depends_on:
+      - postgres
+      - consul
+    networks:
+      - app-network
 
   account-service:
     build:
@@ -42,38 +117,47 @@ services:
       dockerfile: Dockerfile
     environment:
       - NODE_ENV=production
-      - PORT=12000
+      - PORT=0
       - POSTGRES_HOST=postgres
       - POSTGRES_DB=registry
       - POSTGRES_USER=admin
       - POSTGRES_PASSWORD=password
       - KEYCLOAK_ADMIN_URL=http://host.docker.internal:8080
       - KEYCLOAK_ADMIN_USERNAME=admin
-      - KEYCLOAK_ADMIN_PASSWORD=admin  # Replace with your Keycloak admin password
-    ports:
-      - "12000:12000"
+      - KEYCLOAK_ADMIN_PASSWORD=admin
+      - CONSUL_HOST=consul
+      - HOSTNAME=account-service
     depends_on:
       postgres:
         condition: service_healthy
+      consul:
+        condition: service_started
+    networks:
+      - app-network
+
   database-service:
     build:
       context: ./services/registry/database
       dockerfile: Dockerfile
     environment:
       - NODE_ENV=production
-      - PORT=5001
-      - POSTGRES_HOST=postgres  # Service name instead of localhost
+      - PORT=0
+      - POSTGRES_HOST=postgres
       - POSTGRES_DB=registry
       - POSTGRES_USER=admin
       - POSTGRES_PASSWORD=password
       - KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs
       - KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30
       - KEYCLOAK_AUDIENCE=account
-    ports:
-      - "5001:5001"
+      - CONSUL_HOST=consul
+      - HOSTNAME=database-service
     depends_on:
       postgres:
         condition: service_healthy
+      consul:
+        condition: service_started
+    networks:
+      - app-network
 
   registry-service:
     build:
@@ -81,7 +165,7 @@ services:
       dockerfile: Dockerfile
     environment:
       - NODE_ENV=production
-      - PORT=6000
+      - PORT=0
       - POSTGRES_HOST=postgres
       - POSTGRES_DB=registry
       - POSTGRES_USER=admin
@@ -89,13 +173,17 @@ services:
       - KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs
       - KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30
       - KEYCLOAK_AUDIENCE=account
-    ports:
-      - "6000:6000"
+      - CONSUL_HOST=consul
+      - HOSTNAME=registry-service
     depends_on:
       postgres:
         condition: service_healthy
       database-service:
         condition: service_started
+      consul:
+        condition: service_started
+    networks:
+      - app-network
 
   enrollment-service:
     build:
@@ -103,12 +191,16 @@ services:
       dockerfile: Dockerfile
     environment:
       - NODE_ENV=production
-      - PORT=3000
+      - PORT=0
       - KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs
       - KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30
       - KEYCLOAK_AUDIENCE=account
-    ports:
-      - "3000:3000"
+      - CONSUL_HOST=consul
+      - HOSTNAME=enrollment-service
+    depends_on:
+      - consul
+    networks:
+      - app-network
 
   identity-service:
     build:
@@ -116,13 +208,23 @@ services:
       dockerfile: Dockerfile
     environment:
       - NODE_ENV=production
-      - PORT=4000
+      - PORT=0
       - KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs
       - KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30
       - KEYCLOAK_AUDIENCE=account
-    ports:
-      - "4000:4000"
+      - CONSUL_HOST=consul
+      - HOSTNAME=identity-service
+    depends_on:
+      - consul
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
 
 volumes:
   postgres-data:
+    driver: local
+  kong-db-data:
     driver: local

@@ -1,20 +1,29 @@
 {
-    "name": "registry-service",
-    "version": "1.0.0",
-    "description": "Registry Service",
-    "main": "index.js",
-    "scripts": {
-      "start": "node index.js"
-    },
-    "dependencies": {
-        "express": "^4.17.1",
-        "pg": "^8.7.3",
-        "node-fetch": "^2.6.7",
-        "uuid": "^8.3.2",
-        "jsonwebtoken": "^9.0.2",
-        "jwks-rsa": "^3.1.0",
-        "cors": "^2.8.5"
-    },
-    "author": "eGovernments Foundation",
-    "license": "MIT"
+  "name": "registry-service",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "eGovernment Foundation",
+  "description": "GovStack Registry Building Block Service",
+  "license": "MIT",
+  "dependencies": {
+    
+    "cors": "^2.8.5",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "jwks-rsa": "^3.1.0",
+    "node-fetch": "^2.7.0",
+    "pg": "^8.11.3",
+    "uuid": "^9.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
+}

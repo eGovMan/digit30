@@ -6,6 +6,9 @@ const jwt = require('jsonwebtoken');
 const jwksClient = require('jwks-rsa');
 const cors = require('cors');
 
+const CONSUL_HOST = process.env.CONSUL_HOST || 'consul';
+const CONSUL_PORT = process.env.CONSUL_PORT || 8500;
+
 const app = express();
 app.use(express.json());
 app.use(cors({
@@ -21,6 +24,7 @@ const pool = new Pool({
   password: process.env.POSTGRES_PASSWORD || 'password',
   port: 5432,
 });
+
 
 // JWKS client for token validation
 const client = jwksClient({
@@ -59,7 +63,12 @@ function authenticateToken(req, res, next) {
 // Helper function to fetch schema from database-service
 async function getDatabaseSchema(registryName, token) {
   try {
-    const response = await fetch('http://database-service:5001/databases', {
+    const services = await consul.catalog.service.nodes('database-service');
+    if (!services.length) throw new Error('Database service not found');
+    const { Address, ServicePort } = services[0];
+    const url = `http://${Address}:${ServicePort}/databases`;
+
+    const response = await fetch(url, {
       headers: {
         'Authorization': `Bearer ${token}`,
         'Information-Mediator-Client': 'eGovStack/GOV/90000009/digitalregistries',
@@ -70,7 +79,7 @@ async function getDatabaseSchema(registryName, token) {
       throw new Error(`Database service returned ${response.status}`);
     }
     const data = await response.json();
-    console.log('Fetched databases:', JSON.stringify(data, null, 2)); // Log full response
+    console.log('Fetched databases:', JSON.stringify(data, null, 2));
     if (!data || !data.databases || !Array.isArray(data.databases)) {
       console.error('Invalid response format from database-service:', data);
       throw new Error('Invalid database response format');
@@ -86,7 +95,7 @@ async function getDatabaseSchema(registryName, token) {
       console.error(`Schema not found for registryName: ${registryName}`);
       throw new Error('Schema not found');
     }
-    console.log('Found schema:', schema); // Log successful find
+    console.log('Found schema:', schema);
     return schema;
   } catch (err) {
     console.error('Error fetching database schema:', err.message);
@@ -105,7 +114,7 @@ async function initializeRegistryTable(registryName, schema) {
 
   for (const [key, value] of Object.entries(schema.properties)) {
     if (key === 'id') {
-      columns.unshift(`"${key}" VARCHAR(255) PRIMARY KEY`); // Single PRIMARY KEY for id
+      columns.unshift(`"${key}" VARCHAR(255) PRIMARY KEY`);
     } else if (value.type === 'object') {
       columns.push(`"${key}" JSONB`);
     } else {
@@ -123,6 +132,88 @@ async function initializeRegistryTable(registryName, schema) {
     throw err;
   }
 }
+
+// Register service with Consul
+async function registerServiceWithConsul({ ID, Name, Address, Port }) {
+    const maxRetries = 5;
+    let attempt = 0;
+  
+    while (attempt < maxRetries) {
+      try {
+        const response = await fetch(`http://${CONSUL_HOST}:${CONSUL_PORT}/v1/agent/service/register`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            ID,
+            Name,
+            Address,
+            Port
+          })
+        });
+        if (!response.ok) {
+          throw new Error(`Consul registration failed: ${response.status} ${await response.text()}`);
+        }
+        console.log(`Registered with Consul as ${ID} on port ${Port}`);
+        return;
+      } catch (err) {
+        console.error(`Attempt ${attempt + 1} failed to register with Consul: ${err.message}`);
+        attempt++;
+        if (attempt === maxRetries) {
+          console.error(`Failed to register with Consul after ${maxRetries} attempts: ${err.message}`);
+        }
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+  }
+  
+  async function deregisterServiceFromConsul(serviceId) {
+    try {
+      const response = await fetch(`http://${CONSUL_HOST}:${CONSUL_PORT}/v1/agent/service/deregister/${serviceId}`, {
+        method: 'PUT'
+      });
+      if (!response.ok) {
+        throw new Error(`Consul deregistration failed: ${response.status} ${await response.text()}`);
+      }
+      console.log(`Deregistered ${serviceId} from Consul`);
+    } catch (err) {
+      console.error(`Failed to deregister ${serviceId} from Consul: ${err.message}`);
+    }
+  }
+
+async function registerService(port) {
+  const serviceId = `registry-${Date.now()}`; 
+  const maxRetries = 5;
+  let attempt = 0;
+
+  while (attempt < maxRetries) {
+    try {
+      await registerServiceWithConsul({
+        ID: serviceId,
+        Name: 'registry-service',
+        Address: process.env.HOSTNAME || 'registry-service',
+        Port: port
+      });
+      console.log(`Registered with Consul as ${serviceId} on port ${port}`);
+
+      process.on('SIGINT', async () => {
+        await deregisterServiceFromConsul(serviceId);
+        console.log(`Deregistered ${serviceId} from Consul`);
+        process.exit();
+      });
+      return;
+    } catch (err) {
+      console.error(`Attempt ${attempt + 1} failed to register with Consul: ${err.message}`);
+      attempt++;
+      if (attempt === maxRetries) {
+        throw new Error(`Failed to register with Consul after ${maxRetries} attempts: ${err.message}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+  }
+}
+
+// Health check endpoint
+app.get('/health', (req, res) => res.status(200).json({ status: 'healthy' }));
 
 // GET /data/{registryName}/{versionNumber}
 app.post('/data/:registryName/:versionNumber/createEntries', authenticateToken, async (req, res) => {
@@ -214,18 +305,18 @@ app.post('/data/:registryName/:versionNumber/exists', authenticateToken, async (
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  const schema = await getDatabaseSchema(registryName, token);
-  if (!schema || schema.version !== versionNumber) {
-    return res.status(404).json({ error: 'Registry or version not found' });
-  }
-
-  await initializeRegistryTable(registryName, schema.schema);
-
-  const tableName = `registry_${registryName.toLowerCase()}`;
-  const conditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
-  const values = Object.values(query.content);
-
   try {
+    const schema = await getDatabaseSchema(registryName, token);
+    if (!schema || schema.version !== versionNumber) {
+      return res.status(404).json({ error: 'Registry or version not found' });
+    }
+
+    await initializeRegistryTable(registryName, schema.schema);
+
+    const tableName = `registry_${registryName.toLowerCase()}`;
+    const conditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
+    const values = Object.values(query.content);
+
     const result = await pool.query(`SELECT EXISTS (SELECT 1 FROM ${tableName} WHERE ${conditions})`, values);
     res.status(200).json({ answer: { status: result.rows[0].exists, message: result.rows[0].exists ? 'Object found' : 'Object not found' } });
   } catch (err) {
@@ -244,18 +335,18 @@ app.post('/data/:registryName/:versionNumber/read', authenticateToken, async (re
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  const schema = await getDatabaseSchema(registryName, token);
-  if (!schema || schema.version !== versionNumber) {
-    return res.status(404).json({ error: 'Registry or version not found' });
-  }
-
-  await initializeRegistryTable(registryName, schema.schema);
-
-  const tableName = `registry_${registryName.toLowerCase()}`;
-  const conditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
-  const values = Object.values(query.content);
-
   try {
+    const schema = await getDatabaseSchema(registryName, token);
+    if (!schema || schema.version !== versionNumber) {
+      return res.status(404).json({ error: 'Registry or version not found' });
+    }
+
+    await initializeRegistryTable(registryName, schema.schema);
+
+    const tableName = `registry_${registryName.toLowerCase()}`;
+    const conditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
+    const values = Object.values(query.content);
+
     const result = await pool.query(`SELECT * FROM ${tableName} WHERE ${conditions} LIMIT 1`, values);
     if (result.rows.length === 0) {
       return res.status(404).json({ detail: 'no record found' });
@@ -277,20 +368,20 @@ app.put('/data/:registryName/:versionNumber/update', authenticateToken, async (r
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  const schema = await getDatabaseSchema(registryName, token);
-  if (!schema || schema.version !== versionNumber) {
-    return res.status(404).json({ error: 'Registry or version not found' });
-  }
-
-  await initializeRegistryTable(registryName, schema.schema);
-
-  const tableName = `registry_${registryName.toLowerCase()}`;
-  const queryConditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
-  const queryValues = Object.values(query.content);
-  const updateSet = Object.entries(write.content).map(([key, value], i) => `"${key}" = $${i + queryValues.length + 1}`).join(', ');
-  const updateValues = [...queryValues, ...Object.values(write.content)];
-
   try {
+    const schema = await getDatabaseSchema(registryName, token);
+    if (!schema || schema.version !== versionNumber) {
+      return res.status(404).json({ error: 'Registry or version not found' });
+    }
+
+    await initializeRegistryTable(registryName, schema.schema);
+
+    const tableName = `registry_${registryName.toLowerCase()}`;
+    const queryConditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
+    const queryValues = Object.values(query.content);
+    const updateSet = Object.entries(write.content).map(([key, value], i) => `"${key}" = $${i + queryValues.length + 1}`).join(', ');
+    const updateValues = [...queryValues, ...Object.values(write.content)];
+
     const result = await pool.query(`UPDATE ${tableName} SET ${updateSet}, modified_at = NOW() WHERE ${queryConditions} RETURNING *`, updateValues);
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Record not found' });
@@ -312,20 +403,20 @@ app.put('/data/:registryName/:versionNumber/updateEntries', authenticateToken, a
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  const schema = await getDatabaseSchema(registryName, token);
-  if (!schema || schema.version !== versionNumber) {
-    return res.status(404).json({ error: 'Registry or version not found' });
-  }
-
-  await initializeRegistryTable(registryName, schema.schema);
-
-  const tableName = `registry_${registryName.toLowerCase()}`;
-  const queryConditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
-  const queryValues = Object.values(query.content);
-  const updateSet = Object.entries(write.content).map(([key, value], i) => `"${key}" = $${i + queryValues.length + 1}`).join(', ');
-  const updateValues = [...queryValues, ...Object.values(write.content)];
-
   try {
+    const schema = await getDatabaseSchema(registryName, token);
+    if (!schema || schema.version !== versionNumber) {
+      return res.status(404).json({ error: 'Registry or version not found' });
+    }
+
+    await initializeRegistryTable(registryName, schema.schema);
+
+    const tableName = `registry_${registryName.toLowerCase()}`;
+    const queryConditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
+    const queryValues = Object.values(query.content);
+    const updateSet = Object.entries(write.content).map(([key, value], i) => `"${key}" = $${i + queryValues.length + 1}`).join(', ');
+    const updateValues = [...queryValues, ...Object.values(write.content)];
+
     const result = await pool.query(`UPDATE ${tableName} SET ${updateSet}, modified_at = NOW() WHERE ${queryConditions}`, updateValues);
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'No records updated' });
@@ -347,20 +438,20 @@ app.post('/data/:registryName/:versionNumber/updateOrCreate', authenticateToken,
     return res.status(400).json({ error: 'Missing required fields' });
   }
 
-  const schema = await getDatabaseSchema(registryName, token);
-  if (!schema || schema.version !== versionNumber) {
-    return res.status(404).json({ error: 'Registry or version not found' });
-  }
-
-  await initializeRegistryTable(registryName, schema.schema);
-
-  const tableName = `registry_${registryName.toLowerCase()}`;
-  const queryConditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
-  const queryValues = Object.values(query.content);
-  const updateSet = Object.entries(write.content).map(([key, value], i) => `"${key}" = $${i + queryValues.length + 1}`).join(', ');
-  const updateValues = [...queryValues, ...Object.values(write.content)];
-
   try {
+    const schema = await getDatabaseSchema(registryName, token);
+    if (!schema || schema.version !== versionNumber) {
+      return res.status(404).json({ error: 'Registry or version not found' });
+    }
+
+    await initializeRegistryTable(registryName, schema.schema);
+
+    const tableName = `registry_${registryName.toLowerCase()}`;
+    const queryConditions = Object.entries(query.content).map(([key, value], i) => `"${key}" = $${i + 1}`).join(' AND ');
+    const queryValues = Object.values(query.content);
+    const updateSet = Object.entries(write.content).map(([key, value], i) => `"${key}" = $${i + queryValues.length + 1}`).join(', ');
+    const updateValues = [...queryValues, ...Object.values(write.content)];
+
     const updateResult = await pool.query(`UPDATE ${tableName} SET ${updateSet}, modified_at = NOW() WHERE ${queryConditions} RETURNING *`, updateValues);
     if (updateResult.rowCount > 0) {
       return res.status(200).json({ content: updateResult.rows[0] });
@@ -384,16 +475,16 @@ app.delete('/data/:registryName/:versionNumber/:id/delete', authenticateToken, a
   const { registryName, versionNumber, id } = req.params;
   const token = req.headers['authorization'].split(' ')[1];
 
-  const schema = await getDatabaseSchema(registryName, token);
-  if (!schema || schema.version !== versionNumber) {
-    return res.status(404).json({ error: 'Registry or version not found' });
-  }
-
-  await initializeRegistryTable(registryName, schema.schema);
-
-  const tableName = `registry_${registryName.toLowerCase()}`;
-
   try {
+    const schema = await getDatabaseSchema(registryName, token);
+    if (!schema || schema.version !== versionNumber) {
+      return res.status(404).json({ error: 'Registry or version not found' });
+    }
+
+    await initializeRegistryTable(registryName, schema.schema);
+
+    const tableName = `registry_${registryName.toLowerCase()}`;
+
     const result = await pool.query(`DELETE FROM ${tableName} WHERE id = $1`, [id]);
     if (result.rowCount === 0) {
       return res.status(404).json({ error: 'Record not found' });
@@ -410,16 +501,16 @@ app.get('/data/:registryName/:versionNumber/:uuid/readValue/:field.:ext', authen
   const { registryName, versionNumber, uuid, field, ext } = req.params;
   const token = req.headers['authorization'].split(' ')[1];
 
-  const schema = await getDatabaseSchema(registryName, token);
-  if (!schema || schema.version !== versionNumber) {
-    return res.status(404).json({ error: 'Registry or version not found' });
-  }
-
-  await initializeRegistryTable(registryName, schema.schema);
-
-  const tableName = `registry_${registryName.toLowerCase()}`;
-
   try {
+    const schema = await getDatabaseSchema(registryName, token);
+    if (!schema || schema.version !== versionNumber) {
+      return res.status(404).json({ error: 'Registry or version not found' });
+    }
+
+    await initializeRegistryTable(registryName, schema.schema);
+
+    const tableName = `registry_${registryName.toLowerCase()}`;
+
     const result = await pool.query(`SELECT "${field}" FROM ${tableName} WHERE uuid = $1`, [uuid]);
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Record not found' });
@@ -457,7 +548,18 @@ app.get('/data/mypersonalDataUsage', authenticateToken, async (req, res) => {
   res.status(200).json(mockLogs);
 });
 
-const PORT = process.env.PORT || 6000;
-app.listen(PORT, () => {
-  console.log(`Digital Registries Service running on port ${PORT}`);
-});
+// Initialize and start the server
+async function startServer() {
+  try {
+    const server = app.listen(0, async () => {
+      const port = server.address().port; // Corrected to use server object
+      await registerService(port);
+      console.log(`Digital Registries Service running on dynamically assigned port ${port}`);
+    });
+  } catch (err) {
+    console.error('Failed to start server:', err);
+    process.exit(1);
+  }
+}
+
+startServer();

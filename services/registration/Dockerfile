@@ -10,10 +10,9 @@ ENV NODE_ENV=production \
     POSTGRES_HOST=postgres \
     POSTGRES_USER=admin \
     POSTGRES_PASSWORD=password \
-    POSTGRES_DB=registry \
-    KEYCLOAK_BASE_URL=http://localhost:8080 \
-    KEYCLOAK_ADMIN_URL=http://localhost:8080 \
-    KEYCLOAK_ADMIN_USERNAME=admin \
-    KEYCLOAK_ADMIN_PASSWORD=admin \
-    HOSTNAME=account-service
+    POSTGRES_DB=registration \
+    KEYCLOAK_JWKS_URI=http://host.docker.internal:8080/realms/digit30/protocol/openid-connect/certs \
+    KEYCLOAK_ISSUER=http://localhost:8080/realms/digit30 \
+    KEYCLOAK_AUDIENCE=account \
+    HOSTNAME=registration-service
 CMD ["npm", "start"]
