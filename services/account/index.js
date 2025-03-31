@@ -3,7 +3,6 @@ const { Pool } = require('pg');
 const fetch = require('node-fetch');
 const cors = require('cors');
 
-
 const app = express();
 app.use(express.json());
 app.use(cors({ origin: true }));
@@ -16,16 +15,13 @@ const pool = new Pool({
     port: 5432,
 });
 
-
 const KEYCLOAK_BASE_URL = process.env.KEYCLOAK_BASE_URL || 'http://localhost:8080';
 const KEYCLOAK_ADMIN_URL = process.env.KEYCLOAK_ADMIN_URL || 'http://localhost:8080';
 const CONSUL_HOST = process.env.CONSUL_HOST || 'consul';
 const CONSUL_PORT = process.env.CONSUL_PORT || 8500;
 
-
 async function initializeDatabase() {
     try {
-        // Check if the accounts table exists
         const tableExists = await pool.query(`
             SELECT EXISTS (
                 SELECT FROM information_schema.tables 
@@ -36,171 +32,158 @@ async function initializeDatabase() {
         const exists = tableExists.rows[0].exists;
 
         if (!exists) {
-            // Create table if it doesn’t exist
             await pool.query(`
                 CREATE TABLE accounts (
                     id SERIAL PRIMARY KEY,
                     accountname VARCHAR(255) UNIQUE NOT NULL,
                     admin_email VARCHAR(255),
                     admin_phone VARCHAR(255),
-                    client_id VARCHAR(255) UNIQUE NOT NULL,
-                    resource VARCHAR(255) NOT NULL,
-                    auth_url TEXT NOT NULL,
+                    config JSONB NOT NULL,  -- Store all configuration as JSONB
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             `);
-            console.log('Accounts table created');
+            console.log('Accounts table created with config column');
         } else {
-            // Check and add client_id column if missing
-            const clientIdExists = await pool.query(`
+            const configExists = await pool.query(`
                 SELECT EXISTS (
                     SELECT FROM information_schema.columns 
                     WHERE table_schema = 'public' 
                     AND table_name = 'accounts' 
-                    AND column_name = 'client_id'
+                    AND column_name = 'config'
                 );
             `);
-            if (!clientIdExists.rows[0].exists) {
+            if (!configExists.rows[0].exists) {
                 await pool.query(`
                     ALTER TABLE accounts 
-                    ADD COLUMN client_id VARCHAR(255) UNIQUE NOT NULL DEFAULT 'default-client';
+                    ADD COLUMN config JSONB NOT NULL DEFAULT '{}';
                 `);
-                console.log('Added client_id column to accounts table');
-            }
-
-            // Check and add resource column if missing
-            const resourceExists = await pool.query(`
-                SELECT EXISTS (
-                    SELECT FROM information_schema.columns 
-                    WHERE table_schema = 'public' 
-                    AND table_name = 'accounts' 
-                    AND column_name = 'resource'
-                );
-            `);
-            if (!resourceExists.rows[0].exists) {
-                await pool.query(`
-                    ALTER TABLE accounts 
-                    ADD COLUMN resource VARCHAR(255) NOT NULL DEFAULT 'default-resource';
-                `);
-                console.log('Added resource column to accounts table');
-            }
-
-            // Check and add auth_url column if missing
-            const authUrlExists = await pool.query(`
-                SELECT EXISTS (
-                    SELECT FROM information_schema.columns 
-                    WHERE table_schema = 'public' 
-                    AND table_name = 'accounts' 
-                    AND column_name = 'auth_url'
-                );
-            `);
-            if (!authUrlExists.rows[0].exists) {
-                await pool.query(`
-                    ALTER TABLE accounts 
-                    ADD COLUMN auth_url TEXT NOT NULL DEFAULT '';
-                `);
-                console.log('Added auth_url column to accounts table');
+                console.log('Added config column to accounts table');
             }
         }
     } catch (err) {
         console.error('Error initializing database:', err);
-        throw err; // Ensure startup fails if initialization fails
+        throw err;
     }
 }
 
 async function registerServiceWithConsul({ ID, Name, Address, Port }) {
     const maxRetries = 5;
     let attempt = 0;
-  
+
     while (attempt < maxRetries) {
-      try {
-        const response = await fetch(`http://${CONSUL_HOST}:${CONSUL_PORT}/v1/agent/service/register`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            ID,
-            Name,
-            Address,
-            Port
-          })
+        try {
+            const response = await fetch(`http://${CONSUL_HOST}:${CONSUL_PORT}/v1/agent/service/register`, {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ID, Name, Address, Port })
+            });
+            if (!response.ok) {
+                throw new Error(`Consul registration failed: ${response.status} ${await response.text()}`);
+            }
+            console.log(`Registered with Consul as ${ID} on port ${Port}`);
+            return;
+        } catch (err) {
+            console.error(`Attempt ${attempt + 1} failed to register with Consul: ${err.message}`);
+            attempt++;
+            if (attempt === maxRetries) {
+                console.error(`Failed to register with Consul after ${maxRetries} attempts: ${err.message}`);
+            }
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        }
+    }
+}
+
+async function deregisterServiceFromConsul(serviceId) {
+    try {
+        const response = await fetch(`http://${CONSUL_HOST}:${CONSUL_PORT}/v1/agent/service/deregister/${serviceId}`, {
+            method: 'PUT'
         });
         if (!response.ok) {
-          throw new Error(`Consul registration failed: ${response.status} ${await response.text()}`);
+            throw new Error(`Consul deregistration failed: ${response.status} ${await response.text()}`);
         }
-        console.log(`Registered with Consul as ${ID} on port ${Port}`);
-        return;
-      } catch (err) {
-        console.error(`Attempt ${attempt + 1} failed to register with Consul: ${err.message}`);
-        attempt++;
-        if (attempt === maxRetries) {
-          console.error(`Failed to register with Consul after ${maxRetries} attempts: ${err.message}`);
-        }
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-    }
-  }
-  
-  async function deregisterServiceFromConsul(serviceId) {
-    try {
-      const response = await fetch(`http://${CONSUL_HOST}:${CONSUL_PORT}/v1/agent/service/deregister/${serviceId}`, {
-        method: 'PUT'
-      });
-      if (!response.ok) {
-        throw new Error(`Consul deregistration failed: ${response.status} ${await response.text()}`);
-      }
-      console.log(`Deregistered ${serviceId} from Consul`);
+        console.log(`Deregistered ${serviceId} from Consul`);
     } catch (err) {
-      console.error(`Failed to deregister ${serviceId} from Consul: ${err.message}`);
+        console.error(`Failed to deregister ${serviceId} from Consul: ${err.message}`);
     }
-  }
+}
 
 async function registerService(port) {
-    const serviceId = `account-${Date.now()}`; 
-    const maxRetries = 5;
-    let attempt = 0;
-  
-    while (attempt < maxRetries) {
-      try {
-        await registerServiceWithConsul({
-          ID: serviceId,
-          Name: 'account-service', 
-          Address: process.env.HOSTNAME || 'account-service',
-          Port: port
-        });
-        console.log(`Registered with Consul as ${serviceId} on port ${port}`);
-  
-        process.on('SIGINT', async () => {
-          await deregisterServiceFromConsul(serviceId);
-          console.log(`Deregistered ${serviceId} from Consul`);
-          process.exit();
-        });
-        return;
-      } catch (err) {
-        console.error(`Attempt ${attempt + 1} failed to register with Consul: ${err.message}`);
-        attempt++;
-        if (attempt === maxRetries) {
-          throw new Error(`Failed to register with Consul after ${maxRetries} attempts: ${err.message}`);
-        }
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-    }
-  }
+    const serviceId = `account-${Date.now()}`;
+    await registerServiceWithConsul({
+        ID: serviceId,
+        Name: 'account-service',
+        Address: process.env.HOSTNAME || 'account-service',
+        Port: port
+    });
+
+    process.on('SIGINT', async () => {
+        await deregisterServiceFromConsul(serviceId);
+        console.log(`Deregistered ${serviceId} from Consul`);
+        process.exit();
+    });
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => res.status(200).json({ status: 'healthy' }));
 
-// Get client details for an account
+// Get full account details including config
 app.get('/client/:accountname', async (req, res) => {
     const { accountname } = req.params;
     try {
-        const result = await pool.query('SELECT accountname, client_id, resource, auth_url FROM accounts WHERE accountname = $1', [accountname]);
+        const result = await pool.query(
+            'SELECT accountname, admin_email, admin_phone, config FROM accounts WHERE accountname = $1',
+            [accountname]
+        );
         if (result.rowCount === 0) {
             return res.status(404).json({ error: 'Account not found' });
         }
-        const { client_id, resource, auth_url } = result.rows[0];
-        res.json({ realm: accountname, client_id, resource, authUrl: auth_url });
+        const account = result.rows[0];
+        res.json({
+            accountname: account.accountname,
+            adminEmail: account.admin_email,
+            adminPhone: account.admin_phone,
+            ...account.config // Spread config fields (oidc, models, textEmbeddingModels)
+        });
     } catch (err) {
-        console.error('Error fetching client:', err);
+        console.error('Error fetching client details:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Update account configuration (accountname is immutable)
+app.put('/client/:accountname', async (req, res) => {
+    const { accountname } = req.params;
+    const { adminEmail, adminPhone, oidc, models, textEmbeddingModels } = req.body;
+
+    try {
+        const result = await pool.query(
+            'SELECT 1 FROM accounts WHERE accountname = $1',
+            [accountname]
+        );
+        if (result.rowCount === 0) {
+            return res.status(404).json({ error: 'Account not found' });
+        }
+
+        const config = {
+            oidc: oidc || {},
+            models: models || [],
+            textEmbeddingModels: textEmbeddingModels || []
+        };
+
+        const updateResult = await pool.query(
+            'UPDATE accounts SET admin_email = $1, admin_phone = $2, config = $3 WHERE accountname = $4 RETURNING *',
+            [adminEmail || null, adminPhone || null, JSON.stringify(config), accountname]
+        );
+
+        const updatedAccount = updateResult.rows[0];
+        res.json({
+            accountname: updatedAccount.accountname,
+            adminEmail: updatedAccount.admin_email,
+            adminPhone: updatedAccount.admin_phone,
+            ...updatedAccount.config
+        });
+    } catch (err) {
+        console.error('Error updating account:', err);
         res.status(500).json({ error: 'Internal server error' });
     }
 });
@@ -231,13 +214,11 @@ app.post('/create-account', async (req, res) => {
     const resource = `${accountname}-resource`;
 
     try {
-        // Check if accountname exists
         const checkResult = await pool.query('SELECT 1 FROM accounts WHERE accountname = $1', [accountname]);
         if (checkResult.rowCount > 0) {
             return res.status(409).json({ error: 'Account name already exists' });
         }
 
-        // Get Keycloak admin token
         const tokenResponse = await fetch(`${KEYCLOAK_ADMIN_URL}/realms/master/protocol/openid-connect/token`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -250,11 +231,11 @@ app.post('/create-account', async (req, res) => {
         });
         const tokenData = await tokenResponse.json();
         if (!tokenResponse.ok) {
+            console.error('Token response:', tokenData);
             throw new Error('Failed to get admin token: ' + tokenData.error);
         }
         const adminToken = tokenData.access_token;
 
-        // Create Keycloak realm
         const realmResponse = await fetch(`${KEYCLOAK_ADMIN_URL}/admin/realms`, {
             method: 'POST',
             headers: {
@@ -272,7 +253,6 @@ app.post('/create-account', async (req, res) => {
             throw new Error('Failed to create realm: ' + errorText);
         }
 
-        // Create admin user in the new realm
         const userResponse = await fetch(`${KEYCLOAK_ADMIN_URL}/admin/realms/${accountname}/users`, {
             method: 'POST',
             headers: {
@@ -290,7 +270,6 @@ app.post('/create-account', async (req, res) => {
             throw new Error('Failed to create admin user');
         }
 
-        // Create public client in the new realm
         const clientResponse = await fetch(`${KEYCLOAK_ADMIN_URL}/admin/realms/${accountname}/clients`, {
             method: 'POST',
             headers: {
@@ -301,7 +280,7 @@ app.post('/create-account', async (req, res) => {
                 clientId: clientId,
                 enabled: true,
                 publicClient: true,
-                redirectUris: ['http://localhost:5173/login/callback'],
+                redirectUris: ['http://localhost:3002/login/callback', 'http://localhost:5173/login/callback'],
                 protocol: 'openid-connect',
             }),
         });
@@ -309,16 +288,45 @@ app.post('/create-account', async (req, res) => {
             throw new Error('Failed to create client');
         }
 
-        // Construct full Keycloak auth URL
-        const authUrl = `${KEYCLOAK_BASE_URL}/realms/${accountname}/protocol/openid-connect/auth?client_id=${clientId}&response_type=code&redirect_uri=http://localhost:5173/login/callback&scope=openid profile email`;
+        const config = {
+            oidc: {
+                authUrl: `${KEYCLOAK_BASE_URL}/realms/${accountname}/protocol/openid-connect/auth?client_id=${clientId}&response_type=code&redirect_uri=http://localhost:3002/login/callback&scope=openid profile email`,
+                clientId,
+                resource,
+                scopes: "openid profile email",
+                redirectUri: "http://localhost:3002/login/callback",
+                nameClaim: "name",
+                tolerance: "0"
+            },
+            models: [
+                {
+                    name: "microsoft/Phi-3-mini-4k-instruct",
+                    endpoints: [{ type: "llamacpp", baseURL: "http://llama-server:8082" }],
+                    description: "Phi-3-mini model running locally via llama.cpp",
+                    promptExamples: [
+                        { title: "Configure a Registry", prompt: "..." },
+                        { title: "Find and Apply for a Service", prompt: "..." },
+                        { title: "File a Complaint", prompt: "..." }
+                    ]
+                }
+            ],
+            textEmbeddingModels: [
+                {
+                    name: "Xenova/gte-small",
+                    displayName: "Xenova/gte-small",
+                    description: "Local embedding model running on the server.",
+                    chunkCharLength: 512,
+                    endpoints: [{ type: "transformersjs" }]
+                }
+            ]
+        };
 
-        // Store account details including auth_url
         await pool.query(
-            'INSERT INTO accounts (accountname, admin_email, admin_phone, client_id, resource, auth_url) VALUES ($1, $2, $3, $4, $5, $6)',
-            [accountname, adminEmail, adminPhone || null, clientId, resource, authUrl]
+            'INSERT INTO accounts (accountname, admin_email, admin_phone, config) VALUES ($1, $2, $3, $4)',
+            [accountname, adminEmail, adminPhone || null, JSON.stringify(config)]
         );
 
-        res.status(201).json({ message: 'Account created', accountname, client_id: clientId, resource, authUrl });
+        res.status(201).json({ message: 'Account created', accountname, config });
     } catch (err) {
         console.error('Error creating account:', err);
         res.status(500).json({ error: 'Internal server error' });
