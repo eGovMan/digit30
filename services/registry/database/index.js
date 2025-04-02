@@ -39,17 +39,32 @@ function getKey(header, callback) {
 // Authentication middleware using Identity Service tokens
 function authenticateToken(req, res, next) {
   const authHeader = req.headers['authorization'];
+  const account = req.headers['x-account']; 
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
     console.log('Missing or invalid Authorization header');
     return res.status(401).json({ error: 'Unauthorized: Missing or invalid Authorization header' });
   }
 
+  if (!account) {
+    return res.status(400).json({ error: 'Missing X-Account header' });
+  }
+
   const token = authHeader.split(' ')[1];
-  console.log('Received token:', token);
+  const issuer = `http://localhost:8080/realms/${account}`;
+  const jwksUri = `http://host.docker.internal:8080/realms/${account}/protocol/openid-connect/certs`;
+
+  const dynamicClient = jwksClient({ jwksUri });
+
+  function getKey(header, callback) {
+    dynamicClient.getSigningKey(header.kid, (err, key) => {
+      const signingKey = key?.publicKey || key?.rsaPublicKey;
+      callback(err, signingKey);
+    });
+  }
 
   jwt.verify(token, getKey, {
-    issuer: process.env.KEYCLOAK_ISSUER || 'http://localhost:8080/realms/digit30',
-    audience: process.env.KEYCLOAK_AUDIENCE || 'account',
+    issuer,
+    audience: 'account' // or use req.headers['x-client-id'] if you want to validate that too
   }, (err, decoded) => {
     if (err) {
       console.error('Token verification failed:', err.message);
@@ -308,6 +323,8 @@ app.get('/databases', authenticateToken, async (req, res) => {
 
 async function startServer() {
   try {
+    await initializeDatabase(); 
+    
     const server = app.listen(0, async () => {
       const port = server.address().port; // Corrected to use server object
       await registerService(port);
